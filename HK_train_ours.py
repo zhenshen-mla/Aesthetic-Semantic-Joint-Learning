@@ -1,0 +1,182 @@
+import os
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from data_process.processing_HK import make_loader
+from model_arch.HK_network_ours import make_network
+from tensorboardX import SummaryWriter
+from lr_scheduler import LR_Scheduler
+from sklearn import metrics
+import warnings
+import numpy as np
+
+'''
+:parameters
+94.9667, previous best2 = 84.9667
+'''
+ID = 0
+COMMENT = '_0'
+LR = 0.0001
+EPOCHS = 200
+LR_STEP = 25
+
+# (1) distribute GPU
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = str(ID)
+# (2) tensorboardX
+writer = SummaryWriter(comment=COMMENT)
+
+
+def main():
+
+    best_pred_seg = 0.0
+    best_pred_aes = 0.0
+
+    lr = LR
+    num_epochs = EPOCHS
+
+    print('\nloading the dataset ...\n')
+    train_data, val_data, trainloader, valloader = make_loader()
+    print(len(train_data), len(val_data), len(trainloader), len(valloader))
+    print('done')
+
+    print('\nloading the network ...\n')
+    model = make_network()
+
+    criterion_aes = nn.CrossEntropyLoss()
+    criterion_seg = nn.CrossEntropyLoss()
+
+    ## move to GPU
+    print('\nmoving to GPU ...\n')
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    criterion_aes.to(device)
+    criterion_seg.to(device)
+
+    ### optimizer
+    # train_params = [{'params': model.get_1x_lr_params(), 'lr': lr},
+    #                 {'params': model.get_10x_lr_params(), 'lr': lr * 10}]
+
+    optimizer = optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=5e-4, nesterov=False)
+    scheduler = LR_Scheduler(mode='step', base_lr=lr, num_epochs=num_epochs, iters_per_epoch=len(trainloader), lr_step=LR_STEP)
+
+    # training
+    print('\nstart training ...\n')
+
+    for epoch in range(num_epochs):
+
+        running_loss_aes = 0.0
+        running_correct_aes = 0
+        running_total_aes = 0
+
+        running_loss_seg = 0.0
+        running_correct_seg = 0
+        running_total_seg = 0
+
+        model.train()
+        for batch_idx, (data, target_aes, target_seg) in enumerate(trainloader):
+            data, target_aes, target_seg = data.to(device), target_aes.to(device), target_seg.to(device)
+            scheduler(optimizer, batch_idx, epoch, best_pred_aes, best_pred_seg)
+            optimizer.zero_grad()
+
+            # forward
+            pred_aes, pred_seg = model(data)
+            # backward
+            loss_aes = criterion_aes(pred_aes, target_aes)
+            loss_seg = criterion_seg(pred_seg, target_seg)
+            loss = loss_aes + loss_seg
+
+            loss.backward()
+            optimizer.step()
+
+            predict_aes = torch.argmax(pred_aes, 1)
+            correct_aes = torch.eq(predict_aes, target_aes).sum().double().item()
+            predict_seg = torch.argmax(pred_seg, 1)
+            correct_seg = torch.eq(predict_seg, target_seg).sum().double().item()
+
+            running_loss_aes += loss_aes.item()
+            running_loss_seg += loss_seg.item()
+            running_correct_aes += correct_aes
+            running_correct_seg += correct_seg
+            running_total_aes += target_aes.size(0)
+            running_total_seg += target_seg.size(0)
+
+        loss_aes = running_loss_aes * 16 / running_total_aes
+        accuracy_aes = 100 * running_correct_aes / running_total_aes
+        loss_seg = running_loss_seg * 16 / running_total_seg
+        accuracy_seg = 100 * running_correct_seg / running_total_seg
+
+        writer.add_scalar('scalar/loss_aes_train', loss_aes, epoch)
+        writer.add_scalar('scalar/loss_seg_train', loss_seg, epoch)
+        writer.add_scalar('scalar/accuracy_aes_train', accuracy_aes, epoch)
+        writer.add_scalar('scalar/accuracy_seg_train', accuracy_seg, epoch)
+
+        print('aes training ',
+              '    Epoch[%d /50],loss = %.6f,accuracy=%.4f %%' %
+              (epoch + 1, loss_aes, accuracy_aes))
+        print('seg  training ',
+              '    Epoch[%d /50],loss = %.6f,accuracy=%.4f %%' %
+              (epoch + 1, loss_seg, accuracy_seg))
+        print('previous best ',
+              '    Epoch[%d /50], best_pred_aes=%.4f %%, best_pred_seg=%.4f %%' %
+              (epoch + 1, best_pred_aes, best_pred_seg))
+
+        model.eval()
+        with torch.no_grad():
+            running_loss_aes = 0.0
+            running_correct_aes = 0
+            running_total_aes = 0
+
+            running_loss_seg = 0.0
+            running_correct_seg = 0
+            running_total_seg = 0
+
+            for batch_idx, (data, target_aes, target_seg) in enumerate(valloader):
+                data, target_aes, target_seg = data.to(device), target_aes.to(device), target_seg.to(device)
+                optimizer.zero_grad()
+                # forward
+                pred_aes, pred_seg = model(data)
+                # backward
+                loss_aes = criterion_aes(pred_aes, target_aes)
+                loss_seg = criterion_seg(pred_seg, target_seg)
+
+                predict_aes = torch.argmax(pred_aes, 1)
+                correct_aes = torch.eq(predict_aes, target_aes).sum().double().item()
+                predict_seg = torch.argmax(pred_seg, 1)
+                correct_seg = torch.eq(predict_seg, target_seg).sum().double().item()
+
+                running_loss_aes += loss_aes.item()
+                running_loss_seg += loss_seg.item()
+                running_correct_aes += correct_aes
+                running_correct_seg += correct_seg
+                running_total_aes += target_aes.size(0)
+                running_total_seg += target_seg.size(0)
+
+            loss_aes = running_loss_aes * 16 / running_total_aes
+            accuracy_aes = 100 * running_correct_aes / running_total_aes
+            loss_seg = running_loss_seg * 16 / running_total_seg
+            accuracy_seg = 100 * running_correct_seg / running_total_seg
+
+            if accuracy_aes > best_pred_aes:
+                best_pred_aes = accuracy_aes
+            if accuracy_seg > best_pred_seg:
+                best_pred_seg = accuracy_seg
+
+            writer.add_scalar('scalar/loss_aes_val', loss_aes, epoch)
+            writer.add_scalar('scalar/loss_seg_val', loss_seg, epoch)
+            writer.add_scalar('scalar/accuracy_aes_val', accuracy_aes, epoch)
+            writer.add_scalar('scalar/accuracy_seg_val', accuracy_seg, epoch)
+
+            print('aes valing',
+                  '    Epoch[%d /50],loss = %.6f,accuracy=%.4f %%' %
+                  (epoch + 1, loss_aes, accuracy_aes))
+            print('seg valing',
+                  '    Epoch[%d /50],loss = %.6f,accuracy=%.4f %%' %
+                  (epoch + 1, loss_seg, accuracy_seg))
+#
+
+
+if __name__ == "__main__":
+    warnings.filterwarnings('ignore')
+    main()
+    writer.close()
